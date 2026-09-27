@@ -2,6 +2,10 @@
 
 OpenCode V2 CLI plugin: Context and subscription Usage in the session sidebar.
 
+### Preview in the side bar
+<img width="296" height="180" alt="image" src="https://github.com/user-attachments/assets/d94d15f2-22e9-4aae-a7a4-467c09314605" />
+
+### Example
 ```
 Context
 48,210 tokens
@@ -46,3 +50,4 @@ A missing source hides its group; nothing else breaks.
 - `tui.tsx` the sidebar section
 - `usage.ts` readings, formatting, pressure
 - `model-icons.ts` one glyph per model family
+
