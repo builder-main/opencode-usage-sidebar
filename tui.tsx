@@ -22,12 +22,14 @@
 import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import { createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import { glyphCell } from "./model-icons"
-import { fetchAll, POLL_MS, providerPressureLabel, record, rows, SOURCE_INFO, sourceOf, type Level, type Reading, type Samples, type Source } from "./usage"
+import { readSources, statusText, type UsageStatus } from "./poll"
+import { fetchCodex, fetchQuota, POLL_MS, providerPressureLabel, record, rows, SOURCE_INFO, sourceOf, type Level, type Reading, type Samples, type Source } from "./usage"
 
 // ------------------------------------------------------------------ tunables
 
 const LABEL_WIDTH = 6
 const PERCENT_WIDTH = 3
+const RETRY_MS = 10_000
 
 // ------------------------------------------------------------------ helpers
 
@@ -64,6 +66,9 @@ function Sidebar(props: { sessionID: string }) {
     },
   })
   const [now, setNow] = createSignal(Date.now())
+  const [status, setStatus] = createSignal<Record<Source, UsageStatus>>({ claude: "loading", codex: "loading" })
+  const [retryAt, setRetryAt] = createSignal<number>()
+  const retrySeconds = createMemo(() => Math.max(0, Math.ceil(((retryAt() ?? now()) - now()) / 1_000)))
 
   const session = createMemo(() => data.session.get(props.sessionID))
   const providers = createMemo(() => data.location.provider.list(session()?.location) ?? [])
@@ -105,24 +110,56 @@ function Sidebar(props: { sessionID: string }) {
 
   // ---------------------------------------------------------------- usage
 
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout>
+  let countdown: ReturnType<typeof setInterval> | undefined
   async function poll() {
-    //pre-condition : a fresh reading
-    const reading = await fetchAll()
+    //pre-condition : mounted sidebar
+    if (controller.signal.aborted) return
 
-    //post-condition : shared memory holds the latest reading and its history
-    setLive((d) => {
-      d.reading ??= {}
-      d.samples ??= {}
-      for (const [source, buckets] of Object.entries(reading) as Array<[Source, NonNullable<Reading[Source]>]>) {
-        d.reading[source] = buckets
-        record((d.samples[source] ??= {}), buckets)
+    //operation : independent readings, error reporting, scheduled retry
+    clearInterval(countdown)
+    setRetryAt(undefined)
+    setStatus((current) => ({
+      claude: current.claude === "error" ? "retrying" : current.claude,
+      codex: current.codex === "error" ? "retrying" : current.codex,
+    }))
+    const results = await readSources((signal) => fetchQuota(undefined, signal), fetchCodex, controller.signal)
+    if (controller.signal.aborted) return
+    const active = new Set(sources().values())
+    let failed = active.size === 0
+    const next = { ...status() }
+    for (const source of Object.keys(results) as Source[]) {
+      const result = results[source]
+      if ("error" in result) {
+        if (active.has(source)) console.error(`[usage-sidebar] ${source}: ${result.error}`)
+        next[source] = "error"
+        failed ||= active.has(source)
+        continue
       }
-    })
+      next[source] = "ready"
+      setLive((d) => {
+        d.reading ??= {}
+        d.samples ??= {}
+        d.reading[source] = result.buckets
+        record((d.samples[source] ??= {}), result.buckets)
+      })
+    }
+    setStatus(next)
     setNow(Date.now())
+    const delay = failed ? RETRY_MS : POLL_MS
+    if (failed) {
+      setRetryAt(Date.now() + delay)
+      countdown = setInterval(() => setNow(Date.now()), 1_000)
+    }
+    timer = setTimeout(() => void poll(), delay)
   }
 
-  const timer = setInterval(() => void poll(), POLL_MS)
-  onCleanup(() => clearInterval(timer))
+  onCleanup(() => {
+    controller.abort()
+    clearTimeout(timer)
+    clearInterval(countdown)
+  })
   void poll()
 
   // One group per subscription in use; rows undefined means the reading went stale.
@@ -133,8 +170,7 @@ function Sidebar(props: { sessionID: string }) {
       .filter((source) => inUse.has(source))
       .flatMap((source) => {
         const list = rows(live.reading[source] ?? [], live.samples[source] ?? {}, t)
-        if (list?.length === 0) return []
-        return [{ source, ...SOURCE_INFO[source], rows: list, pressure: providerPressureLabel(source, live.reading, t) }]
+        return [{ source, ...SOURCE_INFO[source], rows: list, status: status()[source], pressure: providerPressureLabel(source, live.reading, t) }]
       })
   })
 
@@ -174,11 +210,14 @@ function Sidebar(props: { sessionID: string }) {
         </box>
       </Show>
 
-      <Show when={groups().length}>
+      <Show when={groups().length || !providers().length}>
         <box paddingTop={1} flexDirection="column">
           <text fg={theme.text.base}>
             <b>Usage</b>
           </text>
+          <Show when={!groups().length}>
+            <text fg={theme.text.muted}>Loading usage…</text>
+          </Show>
           <For each={groups()}>
             {(group) => (
               <>
@@ -187,8 +226,8 @@ function Sidebar(props: { sessionID: string }) {
                   <Show when={group.pressure}>
                     {(pressure) => <span style={{ fg: theme.text.muted }}>{"  " + pressure()}</span>}
                   </Show>
-                  <Show when={!group.rows}>
-                    <span style={{ fg: color("dim") }}> ??</span>
+                  <Show when={statusText(group.status, !!group.rows, retrySeconds())}>
+                    {(label) => <span style={{ fg: color("dim") }}>{label()}</span>}
                   </Show>
                 </text>
                 <For each={group.rows ?? []}>
